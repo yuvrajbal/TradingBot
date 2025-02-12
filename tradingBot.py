@@ -11,7 +11,7 @@ import logging
 from telethon import TelegramClient, events
 import yaml
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from openai import OpenAI
 import json
 import pytz
@@ -82,91 +82,156 @@ class TradingBot:
                 contract.right = trade_info['right']
                 contract.multiplier = trade_info.get('multiplier', '100')
 
-            if trade_info.get('secType') == 'FUT':
-                contract.lastTradeDateOrContractMonth = trade_info['lastTradeDateOrContractMonth']
+            # if trade_info.get('secType') == 'FUT':
+            #     contract.lastTradeDateOrContractMonth = trade_info['lastTradeDateOrContractMonth']
             
-        
+            print("Creating order with contract", contract)
             # Create order
             order = Order()
-            order.action = trade_info['action']  # 'BUY' or 'SELL'
+            order.action = 'BUY'  # 'BUY' ONLY
             order.totalQuantity = trade_info['quantity']
-            order.orderType = 'MKT'  # Market order
-            order.outsideRth = True  # Allow outside regular trading hours
+            order.orderType = 'MKT'  # MKT OR LMT order
+            # order.lmtPrice = trade_info.get('entry_price')
+            # order.outsideRth = True  # Allow outside regular trading hours
             
             order_id = self.ibkr_app.nextValidOrderId
             self.ibkr_app.nextValidOrderId += 1
-
+            print("PLACING ORDER with order=", order)
             # Place the order
             self.ibkr_app.placeOrder(order_id, contract, order)
-            
-            # Wait for order status
-            max_wait = 10  # Maximum wait time in seconds
-            start = time.time()
-            
-            while time.time() - start < max_wait:
-                if order_id in self.ibkr_app.order_status:
-                    status = self.ibkr_app.order_status[order_id]
-                    if status['status'] == 'Filled':
-                        fill_price = status['avgFillPrice']
-                        print(f"Order {order_id} filled at {fill_price}")
-                        break
-                await asyncio.sleep(0.1)
+            print("placed buy order", order_id)
 
-            if order_id not in self.ibkr_app.order_status or self.ibkr_app.order_status[order_id]['status'] != 'Filled':
-                print(f"Order {order_id} not filled within {max_wait} seconds")
-                return {'order_id': order_id, 'status': 'Not filled'}
+            async def monitor_order(order_id,contract):
+                while True:
+                    if order_id in self.ibkr_app.order_status:
+                        status = self.ibkr_app.order_status[order_id]
+                        if status['status'] == "Filled":
+                            fill_price = status["avgFillPrice"]
+                            print(f"Order {order_id} filled at {fill_price}")
 
-            if fill_price is None:
-                print(f"Market order {order_id} not filled within {max_wait} seconds. Exiting")
-                return {'order_id': order_id, 'status': 'Not filled'}
-            
+                            # calculate profit target price
+                            raw_target_price = fill_price*1.2
+                            target_price = round(raw_target_price/0.10)*0.10
+                            limit_order = Order()
+                            limit_order.action = "SELL" # sell the contract
+                            limit_order.totalQuantity = trade_info['quantity']
+                            limit_order.orderType = 'LMT'  
+                            limit_order.lmtPrice = target_price
+                            limit_order.outsideRth = True  # Allow outside regular trading hours
+                            limit_order_id = self.ibkr_app.nextValidOrderId
+                            self.ibkr_app.nextValidOrderId += 1
+                            self.ibkr_app.placeOrder(limit_order_id, contract, limit_order)
+                            print(f"Limit sell order {limit_order_id} placed at {target_price}")
+                            execution_time = time.time() - start_time
+                            print(f"Trade executed in {execution_time:.2f} seconds")
+                            return {
+                                'order_id': order_id,
+                                'limit_order_id': limit_order_id,
+                                'status': "Filled and profit order placed",
+                                'fill_price': fill_price,
+                                'target_price': target_price
+                            }
+                        elif status['status'] == "Cancelled":
+                            return {
+                                'order_id': order_id,
+                                'status': "Cancelled"
+                            }
+                    await asyncio.sleep(1) #check every second
 
-            raw_target_price = fill_price*1.2 
-            target_price = round(raw_target_price/0.10)*0.10
-            print(f"Target price: {raw_target_price} -> adjusted to valid tick {target_price}")
-            limit_order = Order()
-            limit_order.action = "SELL"  if trade_info['action'] == "BUY" else "BUY"
-            limit_order.totalQuantity = trade_info['quantity']
-            limit_order.orderType = 'LMT'  
-            limit_order.lmtPrice = target_price
-            limit_order.outsideRth = True  # Allow outside regular trading hours
-
-
-            limit_order_id = self.ibkr_app.nextValidOrderId
-            self.ibkr_app.nextValidOrderId += 1
-            self.ibkr_app.placeOrder(limit_order_id, contract, limit_order)
-            # **Confirm limit order placement**
-            limit_wait = 5  # Wait up to 5 seconds for IBKR to acknowledge
-            start = time.time()
-            confirmed = False
-
-            while time.time() - start < limit_wait:
-                if limit_order_id in self.ibkr_app.order_status:
-                    confirmed = True
-                    print(f"Limit sell order {limit_order_id} placed at {target_price}")
-                    break
-                await asyncio.sleep(0.1)
-            
-            if not confirmed:
-                print(f"Limit order {limit_order_id} might not have been placed. Check IBKR logs.")
-                return {'order_id': order_id, 'status': 'Limit order not placed'}
-            
-            
-            execution_time = time.time() - start_time
-            print(f"Trade executed in {execution_time:.2f} seconds")
-            
-            return {
-                'order_id': order_id,
-                'limit_order_id': limit_order_id if confirmed else None,   
-                'status' : "placed" if confirmed else "limit order not placed",
-                # 'status': self.ibkr_app.order_status.get(order_id, {}).get('status'),
-                'execution_time': execution_time
-            }
+            try:
+                print("monitoring order", order_id)
+                initial_timeout = 10
+                monitoring_task = asyncio.create_task(monitor_order(order_id,contract))
+                result = await asyncio.wait_for(monitoring_task, timeout=initial_timeout)
+                return result
+            except asyncio.TimeoutError:
+                print(f"Initial {initial_timeout} seconds timeout reached. Continuing to monitor in background")
+                
+                async def background_monitor():
+                    try:
+                        result = await monitor_order(order_id,contract)
+                        print(f"Background monitor result: {result}")
+                    except Exception as e:
+                        print(f"Error in background monitor: {str(e)}")
+                
+                asyncio.create_task(background_monitor())
+                
+                return{
+                    'order_id': order_id,
+                    'status': "monitoring in background",
+                    "message" : f"Order not filled within intial {initial_timeout} seconds. Monitoring in background"
+                }
 
         except Exception as e:
             print(f"Error placing trade: {str(e)}")
             logging.error(f"Error placing trade: {str(e)}")
-            raise
+            raise            
+
+            # Wait for order status
+            # max_wait = 10  # Maximum wait time in seconds
+            # start = time.time()
+            
+            # while time.time() - start < max_wait:
+            #     if order_id in self.ibkr_app.order_status:
+            #         status = self.ibkr_app.order_status[order_id]
+            #         if status['status'] == 'Filled':
+            #             fill_price = status['avgFillPrice']
+            #             print(f"Order {order_id} filled at {fill_price}")
+            #             break
+            #     await asyncio.sleep(0.1)
+
+            # if order_id not in self.ibkr_app.order_status or self.ibkr_app.order_status[order_id]['status'] != 'Filled':
+            #     print(f"Order {order_id} not filled within {max_wait} seconds")
+            #     return {'order_id': order_id, 'status': 'Not filled'}
+
+            # if fill_price is None:
+            #     print(f"Market order {order_id} not filled within {max_wait} seconds. Exiting")
+            #     return {'order_id': order_id, 'status': 'Not filled'}
+            
+
+            # raw_target_price = fill_price*1.2 
+            # target_price = round(raw_target_price/0.10)*0.10
+            # print(f"Target price: {raw_target_price} -> adjusted to valid tick {target_price}")
+            # limit_order = Order()
+            # limit_order.action = "SELL"  if trade_info['action'] == "BUY" else "BUY"
+            # limit_order.totalQuantity = trade_info['quantity']
+            # limit_order.orderType = 'LMT'  
+            # limit_order.lmtPrice = target_price
+            # limit_order.outsideRth = True  # Allow outside regular trading hours
+
+
+            # limit_order_id = self.ibkr_app.nextValidOrderId
+            # self.ibkr_app.nextValidOrderId += 1
+            # self.ibkr_app.placeOrder(limit_order_id, contract, limit_order)
+            # # **Confirm limit order placement**
+            # limit_wait = 5  # Wait up to 5 seconds for IBKR to acknowledge
+            # start = time.time()
+            # confirmed = False
+
+            # while time.time() - start < limit_wait:
+            #     if limit_order_id in self.ibkr_app.order_status:
+            #         confirmed = True
+            #         print(f"Limit sell order {limit_order_id} placed at {target_price}")
+            #         break
+            #     await asyncio.sleep(0.1)
+            
+            # if not confirmed:
+            #     print(f"Limit order {limit_order_id} might not have been placed. Check IBKR logs.")
+            #     return {'order_id': order_id, 'status': 'Limit order not placed'}
+            
+            
+            # execution_time = time.time() - start_time
+            # print(f"Trade executed in {execution_time:.2f} seconds")
+            
+            # return {
+            #     'order_id': order_id,
+            #     'limit_order_id': limit_order_id if confirmed else None,   
+            #     'status' : "placed" if confirmed else "limit order not placed",
+            #     # 'status': self.ibkr_app.order_status.get(order_id, {}).get('status'),
+            #     'execution_time': execution_time
+            # }
+
+   
 
     async def cleanup(self):
         """Cleanup IBKR connection"""
@@ -298,7 +363,7 @@ class TelegramTrader:
             )
             print("openai responed with trade info", trade_info)
             
-            if trade_info and trade_info.get('action') and trade_info.get('symbol'):
+            if trade_info and trade_info.get('action') and trade_info.get('action')!="IGNORE" and trade_info.get('symbol'):
                 logging.info(f"Valid trade alert detected: {trade_info}")
                 return trade_info
             else:
@@ -309,6 +374,13 @@ class TelegramTrader:
             logging.error(f"Error processing with OpenAI: {str(e)}")
             return None
 
+    def get_next_friday(self):
+        """Returns the next Friday's date in YYYYMMDD format."""
+        today = datetime.now(pytz.timezone("America/New_York"))
+        days_until_friday = (4 - today.weekday()) % 7  # Friday is weekday 4
+        next_friday = today + timedelta(days=days_until_friday)
+        return next_friday.strftime('%Y%m%d')
+    
     def parse_with_openai(self, message_text):
         """Parse trading alert using OpenAI API"""
         est = pytz.timezone("America/New_York")
@@ -316,55 +388,49 @@ class TelegramTrader:
         
         try:
             system_prompt = f"""
-                You are a trading alert parser for stocks, options, and futures. Extract relevant trading details from messages. If an option is given, use the stricter one always.
+            You are a trading alert parser for options only. Extract relevant trading details from messages. 
+            **Ignore any message that does not contain both a valid ticker and a strike price.** If an option is given, use the stricter one always.
 
-                ### **Parsing Rules:**
-                #### **1️⃣ Stock Options:**
-                
-                - **Extract Ticker and Strike Price:**  
-                - The **ticker** will be extracted from the message if it contains a recognizable stock symbol.  
-                - `"C"` or `"c"` **after a number** means a **Call Option**, and the number is the **strike price**.  
-                - `"P"` or `"p"` **after a number** means a **Put Option**, and the number is the **strike price**.
+            ### **Parsing Rules:**
+            #### **1️⃣ Stock Options:**
 
-                - **Expiry Date Extraction:**
-                - If a date is provided in `MM/DD` or `M/D` format (e.g., `"8/19"` or `"12/5"`), interpret it as **the expiration date**.
-                - **Assume the expiry year is 2025** unless a year is explicitly stated.
-                - Convert the expiry date to **ISO format (`YYYY-MM-DD`)**.
-                - **Default expiry date** (if missing): **"{today_est}"** (today’s date in EST).
+            - **Extract Ticker and Strike Price:**
+            - The **ticker** will be extracted from the message if it contains a recognizable stock symbol.
+            - `"C"` or `"c"` **after a number** means a **Call Option**, and the number is the **strike price**.
+            - `"P"` or `"p"` **after a number** means a **Put Option**, and the number is the **strike price**.
 
-                - **Risk Identification:**
-                - If the message contains words like `"risky"` or `"lotto"`, set `"risk": true`.
+            - **Mandatory Fields Filtering:**
+            - **Ignore messages that do not contain both a ticker and a valid strike price.**
+            - **Ignore messages related to partial exits, scaling, selling, or general market updates** (e.g., `"Scaling out 30% at 5"`, `"Sold 50% at 5"`, `"Market looks weak"`).
 
-                - **BUY-Only Filtering:**
-                - Only process messages that clearly state **"buy"** or **"bought"**.
-                - Ignore any messages related to **"sell"**, **"sold"**, or **"short"**.
+            - **Expiry Date Extraction:**
+            - If a date is provided in `MM/DD` or `M/D` format (e.g., `"8/19"` or `"12/5"`), interpret it as **the expiration date**.
+            - **Assume the expiry year is 2025** unless a year is explicitly stated.
+            - Convert the expiry date to **ISO format (`YYYY-MM-DD`)**.
+            - **Default expiry date** (if missing):  
+                - For **SPX options**, set expiry to **"{today_est}"** (today’s date).  
+                - For **stock options (e.g., TSLA, NVDA, AAPL)**, set expiry to **next Friday** ("{self.get_next_friday()}").  
 
-                ---
+            - **Risk Identification:**
+            - If the message contains words like `"risky"` or `"lotto"`, set `"risk": true`.
 
-                #### **2️⃣ Futures Contracts (ES, NQ, etc.):**
-                - If a message contains **"ES"** or **"NQ"** followed by `"long"`, it is a **futures buy trade**.
-                - Extract:
-                - **Action** (`"BUY"` for long positions).
-                - **Symbol** (e.g., `"ES"`, `"NQ"`).
-                - **Entry price** (the number following `"long"`).
-                - **Stop loss** (if mentioned around X/Y, e.g., `"stop loss around 6058/6054, pick the stricter stop loss, higher value, stop loss = 6058"`).
+            - **BUY-Only Filtering:**
+            - Only process messages that clearly state **"buy"** or **"bought"**.
+            - **Ignore all messages related to "sell", "sold", "short", "scaling", "exiting", or general market comments.**
 
-                ---
-
-                ### **Return Format (JSON Only)**
-                You must return a JSON object with the following fields:
-                ```json
-                {{
-                "action": "BUY",
-                "symbol": "Stock ticker (e.g., AAPL, SPX, TSLA)",
-                "strike_price": "Strike price for options (if applicable)",
-                "option_type": "CALL" or "PUT" (if applicable)",
-                "expiry": "Expiration date in YYYYMMDD format (if applicable)",
-                "entry_price": "Entry price (if specified)",
-                "stop_loss": "Stop loss price for futures trades (if applicable)",
-                "risk": true (if the trade is marked as risky or a lotto play)
-                }}
-                ```
+            ### **Return Format (JSON Only)**
+            You must return a JSON object with the following fields:
+            ```json
+            {{
+            "action": "BUY",
+            "symbol": "Stock ticker (e.g., AAPL, SPX, TSLA)",
+            "strike_price": "Strike price for options",
+            "option_type": "CALL" or "PUT",
+            "expiry": "Expiration date in YYYYMMDD format",
+            "entry_price": "Entry price (if specified)",
+            "stop_loss": "Stop loss price(if applicable)",
+            "risk": true (if the trade is marked as risky or a lotto play)
+            }}
             """
 
 
@@ -383,6 +449,11 @@ class TelegramTrader:
             print(f"API Response Time: {end - start:.2f} seconds")
             
             parsed_data = json.loads(response.choices[0].message.content)
+            if parsed_data.get('option_type') and not parsed_data.get('expiry'):
+                if parsed_data['symbol'] == 'SPX':
+                    parsed_data['expiry'] = today_est  # Use today's date for SPX
+                else:
+                    parsed_data['expiry'] = self.get_next_friday()  # Use Friday for stock options
             logging.info(f"OpenAI parsed data: {parsed_data}")
             print("openai parsed data", parsed_data)
             return parsed_data
@@ -391,6 +462,9 @@ class TelegramTrader:
             logging.error(f"Error parsing with OpenAI: {str(e)}")
             return None
 
+
+    
+    
     async def convert_to_ibkr_format(self, trade_info):
         """Convert OpenAI parsed data to IBKR format"""
      
@@ -402,7 +476,8 @@ class TelegramTrader:
             'action': trade_info['action'],
             'quantity': self.trade_config['quantity'],
             'exchange': 'SMART',
-            'currency': 'USD'
+            'currency': 'USD',
+            'entry_price': float(trade_info.get('entry_price'))
       }
 
       # Handle options
