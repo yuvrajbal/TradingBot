@@ -1,3 +1,5 @@
+from email import message
+import re
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
@@ -11,7 +13,7 @@ import logging
 from telethon import TelegramClient, events
 import yaml
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from openai import OpenAI
 import json
 import pytz
@@ -108,28 +110,50 @@ class TradingBot:
                         if status['status'] == "Filled":
                             fill_price = status["avgFillPrice"]
                             print(f"Order {order_id} filled at {fill_price}")
+                            profit_targets = [
+                            (0.25, 0.50),  # 25% profit, 50% quantity
+                            (0.35, 0.30),  # 35% profit, 30% quantity
+                            (0.50, 0.10),  # 50% profit, 10% quantity
+                            (0.75, 0.10)   # 75% profit, 10% quantity
+                            ]
+                            limit_order_ids = []
+                            for profit, qty_fraction in profit_targets:
+                                raw_target_price = round(fill_price * (1 + profit), 2)
+                                target_price = round(raw_target_price/0.10)*0.10
+                                limit_order = Order()
+                                limit_order.action = "SELL"
+                                limit_order.totalQuantity = round(trade_info['quantity'] * qty_fraction)
+                                limit_order.orderType = 'LMT'
+                                limit_order.lmtPrice = target_price
+                                limit_order.outsideRth = True
+                                if limit_order.totalQuantity > 0:  # Ensure valid order
+                                    limit_order_id = self.ibkr_app.nextValidOrderId
+                                    self.ibkr_app.nextValidOrderId += 1
+                                    self.ibkr_app.placeOrder(limit_order_id, contract, limit_order)
+                                    limit_order_ids.append((limit_order_id, target_price))
 
-                            # calculate profit target price
-                            raw_target_price = fill_price*1.2
-                            target_price = round(raw_target_price/0.10)*0.10
-                            limit_order = Order()
-                            limit_order.action = "SELL" # sell the contract
-                            limit_order.totalQuantity = trade_info['quantity']
-                            limit_order.orderType = 'LMT'  
-                            limit_order.lmtPrice = target_price
-                            limit_order.outsideRth = True  # Allow outside regular trading hours
-                            limit_order_id = self.ibkr_app.nextValidOrderId
-                            self.ibkr_app.nextValidOrderId += 1
-                            self.ibkr_app.placeOrder(limit_order_id, contract, limit_order)
-                            print(f"Limit sell order {limit_order_id} placed at {target_price}")
+                                    print(f"Limit sell order {limit_order_id} placed for {limit_order.totalQuantity} at {target_price}")
+                            # # calculate profit target price
+                            # raw_target_price = fill_price*1.2
+                            # target_price = round(raw_target_price/0.10)*0.10
+                            # limit_order = Order()
+                            # limit_order.action = "SELL" # sell the contract
+                            # limit_order.totalQuantity = trade_info['quantity']
+                            # limit_order.orderType = 'LMT'  
+                            # limit_order.lmtPrice = target_price
+                            # limit_order.outsideRth = True  # Allow outside regular trading hours
+                            # limit_order_id = self.ibkr_app.nextValidOrderId
+                            # self.ibkr_app.nextValidOrderId += 1
+                            # self.ibkr_app.placeOrder(limit_order_id, contract, limit_order)
+                            # print(f"Limit sell order {limit_order_id} placed at {target_price}")
                             execution_time = time.time() - start_time
                             print(f"Trade executed in {execution_time:.2f} seconds")
                             return {
                                 'order_id': order_id,
-                                'limit_order_id': limit_order_id,
-                                'status': "Filled and profit order placed",
+                                'limit_orders': limit_order_ids,
+                                'status': "Filled and staggered sell orders placed",
                                 'fill_price': fill_price,
-                                'target_price': target_price
+                                'execution_time': execution_time
                             }
                         elif status['status'] == "Cancelled":
                             return {
@@ -260,7 +284,7 @@ class TelegramTrader:
         self.lock = asyncio.Lock()  # Add lock for thread safety
 
         self.trade_config = {
-            'quantity': 1,  # Fixed quantity
+            'quantity': 10,  # Fixed quantity
             'stop_loss_percent': 0.10,  
         }
         self.active_positions = {}
@@ -272,16 +296,28 @@ class TelegramTrader:
         
         await self.telegram_client.start()
         await self.trading_bot.init_ibkr()
-      
+        self.start_timestamp = datetime.now(timezone.utc)
+        async for message in self.telegram_client.iter_messages(self.config['telegram']['primary_group_id'], limit=1):
+            self.last_message_id = message.id
+
         # Start message processor
         processor_task = asyncio.create_task(self.process_messages())
-      
-        @self.telegram_client.on(events.NewMessage(chats=self.config['telegram']['group_id']))
+        high_conviction_alerts = self.config['telegram']['primary_group_id']
+        low_conviction_alerts = self.config['telegram']['secondary_group_id']
+
+        @self.telegram_client.on(events.NewMessage(chats=[high_conviction_alerts,low_conviction_alerts]))
         async def handler(event):
-            if event.message.id not in self.processed_messages:
-                logging.info(f"New message received: {event.message.text}")
-                print("message added to queue", event.message.text)
-                await self.message_queue.put(event)
+            # and event.message.id > self.last_message_id
+            if event.message.date >= self.start_timestamp and event.message.id  not in self.processed_messages:
+                low_priority = event.chat_id == low_conviction_alerts
+                message_data = {
+                    "event": event,
+                    "low_priority": low_priority
+                }
+
+                logging.info(f"New message received from {'Secondary' if low_priority else 'Primary'} channel: {self.clean_message(event.message.text)}")
+                print(f"Message added to queue ({'Low Priority' if low_priority else 'High Priority'}):", event.message.text)
+                await self.message_queue.put(message_data)
               
 
         await self.telegram_client.run_until_disconnected()
@@ -295,7 +331,9 @@ class TelegramTrader:
         """Process messages from the queue"""
         while True:
             try:
-                event = await self.message_queue.get()
+                message_data = await self.message_queue.get()
+                event = message_data['event']
+                low_priority = message_data['low_priority']
                 
                 # Check if message was already processed
                 if event.message.id in self.processed_messages:
@@ -307,28 +345,32 @@ class TelegramTrader:
                 print("processing message from the queue", event.message.text)
                 
                 # Process the message
-                await self.handle_message(event, start_time)
+                await self.handle_message(event, start_time, low_priority)
                 
             except Exception as e:
                 logging.error(f"Error processing message: {str(e)}")
             finally:
                 self.message_queue.task_done()
+    
+    def clean_message(self,message):
+        # Remove emojis and non-standard symbols
+        cleaned_message = re.sub(r'[^\w\s.,:!-]', '', message)
+        return cleaned_message
 
-
-    async def handle_message(self, event, start_time):
+    async def handle_message(self, event, start_time, low_priority):
         """Handle individual messages"""
         try:
             async with self.lock:  # Use lock to prevent concurrent processing
                 message_text = event.message.text
-                structured_message = message_text
-
+                structured_message = self.clean_message(message_text)
+                print("Cleaned message", structured_message)
     
                 logging.info(f"Processing message:{structured_message}")
-                print("got message", structured_message)
+                print("Starting to process message", structured_message)
                 # Process with OpenAI directly instead of creating a new task
                 trade_info = await self.process_with_openai(structured_message)
                 if trade_info:
-                  ibkr_order = await self.convert_to_ibkr_format(trade_info)
+                  ibkr_order = await self.convert_to_ibkr_format(trade_info, low_priority)
                   logging.info(f"sending order details to ibkr place_order: {ibkr_order}")
 
                   if not self.trading_bot.ibkr_app:
@@ -388,55 +430,83 @@ class TelegramTrader:
         
         try:
             system_prompt = f"""
-            You are a trading alert parser for options only. Extract relevant trading details from messages. 
-            **Ignore any message that does not contain both a valid ticker and a strike price.** If an option is given, use the stricter one always.
+                You are a trading alert parser for options only. Your primary goal is to NEVER miss a buy alert.
 
-            ### **Parsing Rules:**
-            #### **1️⃣ Stock Options:**
+                ### **CORE TRADE IDENTIFICATION:**
+                - **Buy Signal Keywords (MUST HAVE ONE):**
+                    - "buy", "Buy", "BUY", "bought", "Bought", "BOUGHT"
+                    - These can appear anywhere in the message
 
-            - **Extract Ticker and Strike Price:**
-            - The **ticker** will be extracted from the message if it contains a recognizable stock symbol.
-            - `"C"` or `"c"` **after a number** means a **Call Option**, and the number is the **strike price**.
-            - `"P"` or `"p"` **after a number** means a **Put Option**, and the number is the **strike price**.
+                - **Valid Trade Components:**
+                    - Ticker (e.g., SPX, AAPL, TSLA)
+                    - Strike Price (number followed by C/c/P/p)
+                    - Entry Price (if provided, usually after "at" or "@")
 
-            - **Mandatory Fields Filtering:**
-            - **Ignore messages that do not contain both a ticker and a valid strike price.**
-            - **Ignore messages related to partial exits, scaling, selling, or general market updates** (e.g., `"Scaling out 30% at 5"`, `"Sold 50% at 5"`, `"Market looks weak"`).
+                ### **PARSING PRIORITY:**
+                1. First, identify if message contains any buy signal
+                2. Then, extract the first valid trade components that follow
+                3. Ignore everything after "roll" or "using profit from"
 
-            - **Expiry Date Extraction:**
-            - If a date is provided in `MM/DD` or `M/D` format (e.g., `"8/19"` or `"12/5"`), interpret it as **the expiration date**.
-            - **Assume the expiry year is 2025** unless a year is explicitly stated.
-            - Convert the expiry date to **ISO format (`YYYY-MM-DD`)**.
-            - **Default expiry date** (if missing):  
-                - For **SPX options**, set expiry to **"{today_est}"** (today’s date).  
-                - For **stock options (e.g., TSLA, NVDA, AAPL)**, set expiry to **next Friday** ("{self.get_next_friday()}").  
+                ### **REJECTION CRITERIA:**
+                Only reject if:
+                1. Message contains NO buy signal
+                2. Message is about ES or NQ futures
+                3. Message contains "credit spread" or "debit spread"
+                4. Message is purely about selling/exiting
 
-            - **Risk Identification:**
-            - If the message contains words like `"risky"` or `"lotto"`, set `"risk": true`.
+                ### **PARSING RULES:**
+                - **Strike Price Format:**
+                    - NUMBER + C/c = CALL Option (e.g., "5800C", "6100c")
+                    - NUMBER + P/p = PUT Option (e.g., "5800P", "6100p")
 
-            - **BUY-Only Filtering:**
-            - Only process messages that clearly state **"buy"** or **"bought"**.
-            - **Ignore all messages related to "sell", "sold", "short", "scaling", "exiting", or general market comments.**
+                - **Entry Price:**
+                    - Look for number after "at" or "@"
+                    - Convert to decimal if needed
 
-            ### **Return Format (JSON Only)**
-            You must return a JSON object with the following fields:
-            ```json
-            {{
-            "action": "BUY",
-            "symbol": "Stock ticker (e.g., AAPL, SPX, TSLA)",
-            "strike_price": "Strike price for options",
-            "option_type": "CALL" or "PUT",
-            "expiry": "Expiration date in YYYYMMDD format",
-            "entry_price": "Entry price (if specified)",
-            "stop_loss": "Stop loss price(if applicable)",
-            "risk": true (if the trade is marked as risky or a lotto play)
-            }}
-            """
+                - **Expiration:**
+                    - For SPX: Use "{today_est}" (today)
+                    - For stocks: Use "{self.get_next_friday()}" (next Friday)
+                    - If date provided in MM/DD format, use it with year 2025
+
+                - **Risk Flag:**
+                    - Set true if contains "risky", "lotto", "lottery"
+
+                ### **SPECIAL HANDLING:**
+                - **ALWAYS PARSE** the first valid buy signal even if message contains:
+                    - Roll mentions
+                    - Profit taking
+                    - Multiple trades (take the first one)
+                    - Complex commentary
+
+                ### **OUTPUT FORMAT:**
+                Return JSON for ANY valid buy signal:
+                {{
+                    "action": "BUY",
+                    "symbol": "Ticker",
+                    "strike_price": "Strike price",
+                    "option_type": "CALL" or "PUT",
+                    "expiry": "YYYYMMDD",
+                    "entry_price": "Price if given",
+                    "stop_loss": "If mentioned",
+                    "risk": boolean
+                }}
+
+                ### **Example Valid Trades:**
+                - "Bought SPX 5800C at 1.80 Roll using profit from 6100"
+                    Should parse as: {{
+                        "action": "BUY",
+                        "symbol": "SPX",
+                        "strike_price": "5800",
+                        "option_type": "CALL",
+                        "expiry": "[today's date]",
+                        "entry_price": "1.80"
+                    }}
+                """
 
 
             start = time.time()
             response = self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": message_text}
@@ -447,39 +517,57 @@ class TelegramTrader:
             )
             end = time.time()
             print(f"API Response Time: {end - start:.2f} seconds")
+            response_content = response.choices[0].message.content.strip()
+            print("response content", response_content)
+            if not response_content:
+                response_content = "{}"
+        
+            parsed_data = json.loads(response_content)
             
-            parsed_data = json.loads(response.choices[0].message.content)
-            if parsed_data.get('option_type') and not parsed_data.get('expiry'):
+            if not isinstance(parsed_data, dict):
+                logging.error("Invalid response format from OpenAI")
+                print("Invalid response format from OpenAI")
+                return {}
+            
+            if parsed_data and parsed_data.get('option_type') and not parsed_data.get('expiry'):
+                
                 if parsed_data['symbol'] == 'SPX':
                     parsed_data['expiry'] = today_est  # Use today's date for SPX
                 else:
                     parsed_data['expiry'] = self.get_next_friday()  # Use Friday for stock options
-            logging.info(f"OpenAI parsed data: {parsed_data}")
-            print("openai parsed data", parsed_data)
-            return parsed_data
+            
+            if parsed_data:
+                logging.info(f"OpenAI response: {parsed_data}")
+                print("openai response =", parsed_data)
+                return parsed_data
+            else:
+                logging.info("No valid trade detected,returning empty JSON object")
+                return {}
 
         except Exception as e:
             logging.error(f"Error parsing with OpenAI: {str(e)}")
-            return None
+            return {}
 
 
     
     
-    async def convert_to_ibkr_format(self, trade_info):
+    async def convert_to_ibkr_format(self, trade_info, low_priority):
         """Convert OpenAI parsed data to IBKR format"""
      
         if trade_info['action'].upper() != "BUY":
             return None
 
+        base_quantity  = self.trade_config['quantity']
+        quantity = base_quantity if not low_priority else base_quantity // 2
         ibkr_order = {
             'symbol': trade_info['symbol'],
             'action': trade_info['action'],
-            'quantity': self.trade_config['quantity'],
+            'quantity': quantity,
             'exchange': 'SMART',
             'currency': 'USD',
-            'entry_price': float(trade_info.get('entry_price'))
+            'entry_price': trade_info.get('entry_price') or 0.0,
       }
-
+        print("ibkr order before", ibkr_order)
       # Handle options
         if trade_info.get('option_type'):
             ibkr_order.update({
